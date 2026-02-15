@@ -5,38 +5,45 @@ from discord.ui import Button, View
 import datetime
 import psutil
 import os
+import traceback # เพิ่มตัวช่วยปริ้นท์ Error
 from keep_alive import keep_alive 
 
+# --- CONFIG ---
 TOKEN = os.getenv('TOKEN') 
-MIN_ACCOUNT_AGE_DAYS = 3
-BUTTON_COOLDOWN_SECONDS = 5.0
+MIN_ACCOUNT_AGE_DAYS = 3  
+BUTTON_COOLDOWN_SECONDS = 5.0 
 
+# --- BOT SETUP ---
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# --- HELPER FUNCTIONS ---
 async def send_embed(interaction, title, description, color=discord.Color.blue(), ephemeral=True, is_followup=False):
-    """ฟังก์ชันช่วยส่ง Embed (รองรับทั้ง response และ followup)"""
+    """
+    ฟังก์ชันส่ง Embed ที่ฉลาดขึ้น:
+    - is_followup=True: ใช้สำหรับตอนที่ Defer ไปแล้ว (แก้ปัญหา Interaction Failed)
+    - is_followup=False: ใช้สำหรับตอบกลับปกติ
+    """
     embed = discord.Embed(title=title, description=description, color=color)
     
-    icon_url = None
+    # พยายามดึงรูปโปรไฟล์แบบปลอดภัย
     if interaction.user.avatar:
         icon_url = interaction.user.avatar.url
-    elif interaction.user.default_avatar:
+    else:
         icon_url = interaction.user.default_avatar.url
         
-    if icon_url:
-        embed.set_footer(text=f"Requested by {interaction.user.display_name}", icon_url=icon_url)
-    else:
-        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
-        
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}", icon_url=icon_url)
     embed.timestamp = discord.utils.utcnow()
 
-    if is_followup:
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-    else:
-        await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+    try:
+        if is_followup:
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+    except Exception as e:
+        print(f"❌ Error sending embed: {e}")
 
 def get_color(color_select: str, custom_hex: str):
     if custom_hex:
@@ -45,6 +52,7 @@ def get_color(color_select: str, custom_hex: str):
             return discord.Color(int(clean_hex, 16))
         except:
             pass
+    
     colors = {
         "Default (Gray)": discord.Color.default(),
         "Red": discord.Color.red(),
@@ -59,34 +67,47 @@ def get_color(color_select: str, custom_hex: str):
     }
     return colors.get(color_select, discord.Color.default())
 
+# --- VIEW SYSTEM ---
 class VerifyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.cooldowns = {}
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # 1. เช็คว่าเป็นปุ่ม Verify ของเราหรือไม่
         custom_id = interaction.data.get('custom_id', '')
         if not custom_id.startswith('verify:'):
             return True
 
-        await interaction.response.defer(ephemeral=True)
+        print(f"👉 [DEBUG] User {interaction.user} กดปุ่ม: {custom_id}")
 
+        # 2. **สำคัญมาก** ตอบรับทันทีเพื่อกัน Timeout (Interaction Failed)
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception as e:
+            print(f"❌ [ERROR] Defer ไม่ทัน: {e}")
+            return False
+
+        # 3. เริ่มกระบวนการตรวจสอบ
         user_id = interaction.user.id
         now = datetime.datetime.now().timestamp()
         
+        # Check Cooldown
         if user_id in self.cooldowns:
             retry_after = BUTTON_COOLDOWN_SECONDS - (now - self.cooldowns[user_id])
             if retry_after > 0:
                 await send_embed(
                     interaction, 
-                    "⏳ (Cooldown)", 
+                    "⏳ ใจเย็นวัยรุ่น! (Cooldown)", 
                     f"กรุณารออีก **{retry_after:.1f}** วินาที ก่อนกดใหม่", 
                     discord.Color.orange(),
-                    is_followup=True
+                    is_followup=True # ใช้ Followup เพราะ Defer ไปแล้ว
                 )
                 return False
 
         self.cooldowns[user_id] = now
+        
+        # เรียกฟังก์ชันหลัก
         await self.handle_verify(interaction, custom_id)
         return False 
 
@@ -94,7 +115,7 @@ class VerifyView(discord.ui.View):
         try:
             role_id_str = custom_id.split(':')[1]
             if not role_id_str.isdigit():
-                 await send_embed(interaction, "❌ Error", "Role ID ไม่ถูกต้อง", discord.Color.red(), is_followup=True)
+                 print("❌ Role ID is not a number")
                  return
 
             role_id = int(role_id_str)
@@ -102,18 +123,16 @@ class VerifyView(discord.ui.View):
             user = interaction.user
 
             if not role:
+                print(f"❌ Role ID {role_id} not found")
                 await send_embed(interaction, "❌ Error", "ไม่พบยศนี้ในระบบ (อาจถูกลบไปแล้ว)", discord.Color.red(), is_followup=True)
                 return
 
             account_age = (discord.utils.utcnow() - user.created_at).days
+            print(f"👤 User: {user} | Age: {account_age} days")
 
             if account_age < MIN_ACCOUNT_AGE_DAYS:
+                print(f"🚫 Kicking {user} (Account too new)")
                 try:
-                    try:
-                         await user.send(f"⛔ คุณถูกดีดออกจากเซิร์ฟเวอร์เนื่องจากบัญชีใหม่เกินไป (อายุ {account_age} วัน ต้องการ {MIN_ACCOUNT_AGE_DAYS} วัน)")
-                    except:
-                        pass
-                    
                     await user.kick(reason=f"Anti-Alt: Account age {account_age} days")
                     await send_embed(
                         interaction, 
@@ -123,13 +142,15 @@ class VerifyView(discord.ui.View):
                         is_followup=True
                     )
                 except Exception as e:
-                    await send_embed(interaction, "⚠️ Warning", f"บัญชีเสี่ยง แต่บอท Kick ไม่ได้: {e}", discord.Color.orange(), is_followup=True)
+                    print(f"⚠️ Failed to kick: {e}")
+                    await send_embed(interaction, "⚠️ Warning", "บัญชีเสี่ยง แต่บอทไม่มีสิทธิ์ Kick (เช็คยศบอท)", discord.Color.orange(), is_followup=True)
                 return
 
             if role in user.roles:
                 await send_embed(interaction, "ℹ️ Info", f"คุณมียศ {role.mention} อยู่แล้ว", discord.Color.blue(), is_followup=True)
             else:
                 try:
+                    print(f"✅ Giving role {role.name} to {user}")
                     await user.add_roles(role)
                     await send_embed(
                         interaction, 
@@ -139,13 +160,16 @@ class VerifyView(discord.ui.View):
                         is_followup=True
                     )
                 except discord.Forbidden:
-                    await send_embed(interaction, "❌ Permission Error", "บอทไม่มีสิทธิ์ให้ยศนี้ (ลากยศบอทไว้สูงกว่ายศที่จะแจก)", discord.Color.red(), is_followup=True)
+                    print(f"❌ Forbidden: Cannot give role {role.name}")
+                    await send_embed(interaction, "❌ Permission Error", "บอทไม่มีสิทธิ์ให้ยศนี้ (โปรดลากยศบอทไว้สูงกว่ายศที่จะแจก)", discord.Color.red(), is_followup=True)
         
         except Exception as e:
-            print(f"ERROR: {e}")
-            await send_embed(interaction, "❌ System Error", f"เกิดข้อผิดพลาด: {e}", discord.Color.red(), is_followup=True)
+            print(f"❌ System Error: {e}")
+            traceback.print_exc() # ปริ้นท์จุดที่ Error ออกมา
+            await send_embed(interaction, "❌ System Error", f"{e}", discord.Color.red(), is_followup=True)
 
-@tasks.loop(seconds=15) 
+# --- TASKS ---
+@tasks.loop(seconds=15)
 async def status_task():
     try:
         servers = len(bot.guilds)
@@ -165,17 +189,18 @@ async def status_task():
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user}')
+    print(f'✅ Logged in as {bot.user}')
     status_task.start()
-    bot.add_view(VerifyView()) 
+    bot.add_view(VerifyView())
     try:
         await bot.tree.sync()
-        print("Slash commands synced!")
+        print("✅ Slash commands synced!")
     except Exception as e:
-        print(e)
+        print(f"❌ Sync Error: {e}")
 
+# --- SLASH COMMANDS ---
 
-@bot.tree.command(name="ping", description="เช็คค่าความหน่วงของบอท")
+@bot.tree.command(name="ping", description="เช็คค่าความหน่วงของบอท (Latency)")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     color = discord.Color.green() if latency < 100 else discord.Color.orange()
@@ -183,13 +208,13 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="help", description="ดูรายการคำสั่งทั้งหมด")
 async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(title="🤖 Bot Commands Manual", description="รายการคำสั่งทั้งหมด", color=discord.Color.gold())
-    embed.add_field(name="🛠️ Admin Commands", value="`/setup_embed` - สร้างแผงรับยศ\n`/add_button` - เพิ่มปุ่มใส่ข้อความเดิม", inline=False)
-    embed.add_field(name="ℹ️ General", value="`/ping` - เช็คปิง\n`/help` - ดูหน้านี้", inline=False)
+    embed = discord.Embed(title="🤖 Bot Commands Manual", description="รายการคำสั่งทั้งหมดที่ใช้งานได้", color=discord.Color.gold())
+    embed.add_field(name="🛠️ Admin Commands", value="`/setup_embed` - สร้างแผงรับยศ\n`/add_button` - เพิ่มปุ่มรับยศใส่ข้อความเดิม", inline=False)
+    embed.add_field(name="ℹ️ General", value="`/ping` - เช็คค่าปิง\n`/help` - ดูหน้านี้", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="setup_embed", description="สร้างแผงข้อความสำหรับรับยศ")
-@app_commands.describe(title="หัวข้อ", description="เนื้อหา", color_select="เลือกสี", custom_hex="โค้ดสี Hex", image_url="รูป Banner", thumbnail_url="รูปเล็ก", footer="ข้อความล่าง")
+@bot.tree.command(name="setup_embed", description="สร้างแผงข้อความ (Embed) สำหรับรับยศ")
+@app_commands.describe(title="หัวข้อหลัก", description="เนื้อหา", color_select="เลือกสี", custom_hex="โค้ดสี Hex", image_url="รูป Banner", thumbnail_url="รูปเล็ก", footer="ข้อความด้านล่าง")
 @app_commands.choices(color_select=[
     app_commands.Choice(name="Discord Dark", value="Default (Gray)"),
     app_commands.Choice(name="Red 🔴", value="Red"),
@@ -206,25 +231,23 @@ async def setup_embed(interaction: discord.Interaction, title: str, description:
     if image_url: public_embed.set_image(url=image_url)
     if thumbnail_url: public_embed.set_thumbnail(url=thumbnail_url)
     if footer: public_embed.set_footer(text=footer)
-    
     await interaction.channel.send(embed=public_embed)
     await send_embed(interaction, "✅ Success", "สร้าง Embed เรียบร้อยแล้ว!", discord.Color.green())
 
-@bot.tree.command(name="add_button", description="เพิ่มปุ่มรับยศ")
+@bot.tree.command(name="add_button", description="เพิ่มปุ่มรับยศใส่ในข้อความที่มีอยู่แล้ว")
 @app_commands.describe(message_id="ID ข้อความ", role="ยศที่แจก", label="ชื่อปุ่ม", emoji="ไอคอน", style="สีปุ่ม")
 @app_commands.choices(style=[
-    app_commands.Choice(name="Blue", value="1"),
-    app_commands.Choice(name="Gray", value="2"),
-    app_commands.Choice(name="Green", value="3"),
-    app_commands.Choice(name="Red", value="4")
+    app_commands.Choice(name="Blue (Primary)", value="1"),
+    app_commands.Choice(name="Gray (Secondary)", value="2"),
+    app_commands.Choice(name="Green (Success)", value="3"),
+    app_commands.Choice(name="Red (Danger)", value="4")
 ])
 async def add_button(interaction: discord.Interaction, message_id: str, role: discord.Role, label: str, emoji: str = None, style: str = "3"):
     try:
         msg_id_int = int(message_id)
         message = await interaction.channel.fetch_message(msg_id_int)
-        
         if message.author != bot.user:
-            await send_embed(interaction, "❌ Error", "บอทแก้ไขได้เฉพาะข้อความของตัวเอง", discord.Color.red())
+            await send_embed(interaction, "❌ Error", "บอทแก้ไขได้เฉพาะข้อความของตัวเองเท่านั้น", discord.Color.red())
             return
         
         style_map = {"1": discord.ButtonStyle.blurple, "2": discord.ButtonStyle.gray, "3": discord.ButtonStyle.green, "4": discord.ButtonStyle.red}
@@ -238,15 +261,16 @@ async def add_button(interaction: discord.Interaction, message_id: str, role: di
                         if isinstance(child, discord.Button):
                             old_btn = Button(style=child.style, label=child.label, emoji=child.emoji, url=child.url, disabled=child.disabled, custom_id=child.custom_id)
                             view.add_item(old_btn)
-        
         view.add_item(new_button)
         await message.edit(view=view)
         await send_embed(interaction, "✅ Button Added", f"เพิ่มปุ่ม **{label}** เรียบร้อย!", discord.Color.green())
     except Exception as e:
         await send_embed(interaction, "❌ Error", f"{e}", discord.Color.red())
 
+# --- RUN BOT ---
 if __name__ == "__main__":
-    keep_alive() 
+    keep_alive()  # เริ่ม Web Server หลอกๆ ก่อนรันบอท
+    
     if TOKEN:
         bot.run(TOKEN)
     else:
